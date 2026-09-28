@@ -1,0 +1,420 @@
+{
+  "name": "TIDE | Threat Intel to Detection PRs",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 24
+            }
+          ]
+        }
+      },
+      "id": "45f53d3c-9072-413a-b55f-f4d94f5e6906",
+      "name": "Daily Schedule",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "21069d03-21f2-489b-80ae-7c6cd78cb37f",
+      "name": "Fetch CISA KEV Feed",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        220,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Keep only new, relevant KEV entries. Dedupe via workflow static data\n// (static data persists only for production runs of an ACTIVE workflow).\nconst LOOKBACK_DAYS = 2;\nconst MAX_PER_RUN = 5;\n// Tune this to your environment's tech stack\nconst WATCHLIST = ['microsoft', 'fortinet', 'palo alto', 'cisco', 'ivanti', 'citrix',\n  'vmware', 'atlassian', 'apache', 'linux', 'google', 'apple', 'okta', 'oracle'];\n\nconst feed = $input.first().json;\nconst state = $getWorkflowStaticData('global');\nstate.seen = state.seen || [];\nconst cutoff = Date.now() - LOOKBACK_DAYS * 864e5;\n\nconst fresh = (feed.vulnerabilities || [])\n  .filter(v => new Date(v.dateAdded).getTime() >= cutoff)\n  .filter(v => WATCHLIST.some(w => String(v.vendorProject).toLowerCase().includes(w)))\n  .filter(v => !state.seen.includes(v.cveID))\n  .slice(0, MAX_PER_RUN);\n\nstate.seen = [...state.seen, ...fresh.map(v => v.cveID)].slice(-500);\nreturn fresh.map(v => ({ json: v }));"
+      },
+      "id": "3140bdf7-7321-4729-b499-0b3c86a8c1cf",
+      "name": "Filter New & Relevant",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build one Claude request per KEV entry asking for a Sigma rule draft.\nconst system = `You are a detection engineer on an internal Threat Intelligence and Detection Engineering team.\nWrite ONE Sigma rule (YAML) that detects likely exploitation or post-exploitation of the given vulnerability,\nusing telemetry an enterprise realistically has (EDR process/network/file events, web server or proxy logs, cloud audit logs).\nRequirements:\n- Valid Sigma: title, id (random UUIDv4), status: experimental, description, references (the CVE and its NVD URL),\n  author: TIDE automation (AI draft), date (YYYY-MM-DD, today), tags (attack.* technique tags and cve.YYYY-NNNNN),\n  logsource, detection, falsepositives, level.\n- Prefer behavioural indicators (process lineage, suspicious child processes, anomalous requests) over brittle IOCs.\n- Where exact field values are uncertain, use conservative logic and explain it in a YAML comment.\nRespond with ONLY the raw YAML. No prose, no markdown fences.`;\n\nreturn $input.all().map(item => ({ json: { ...item.json, claude_request: {\n  model: 'claude-sonnet-5',\n  max_tokens: 2000,\n  system,\n  messages: [{ role: 'user', content: `CISA KEV entry:\\n${JSON.stringify(item.json, null, 2)}` }],\n}}}));"
+      },
+      "id": "d1fde55a-b3d8-486f-8b96-30830113a056",
+      "name": "Build Detection Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.claude_request) }}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "d29d24fa-5ba2-46c0-8913-d42bf715759f",
+      "name": "Claude Draft Sigma Rule",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        880,
+        300
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "anthropic-api",
+          "name": "Anthropic API"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000
+    },
+    {
+      "parameters": {
+        "jsCode": "// Extract the Sigma YAML and prepare GitHub PR metadata.\nconst OWNER = 'YOUR-GITHUB-USER';   // <- change\nconst REPO = 'tide-automation';     // <- change\nconst BASE = 'main';\n\nconst src = $('Build Detection Request').all();\nreturn $input.all().map((item, i) => {\n  const kev = src[i].json;\n  const text = (item.json.content || []).filter(b => b.type === 'text').map(b => b.text).join('')\n    .replace(/```ya?ml|```/g, '').trim();\n  const slug = String(kev.cveID).toLowerCase();\n  return { json: {\n    cve: kev.cveID, vendor: kev.vendorProject, product: kev.product, vuln_name: kev.vulnerabilityName,\n    ransomware: kev.knownRansomwareCampaignUse,\n    owner: OWNER, repo: REPO, base: BASE,\n    branch: `detection/${slug}-${Date.now()}`,\n    path: `rules/kev/${slug}.yml`,\n    sigma: text,\n    content_b64: Buffer.from(text + '\\n', 'utf8').toString('base64'),\n    valid: text.includes('logsource:') && text.includes('detection:') && text.includes('condition:'),\n  }};\n}).filter(x => x.json.valid);"
+      },
+      "id": "22df1787-283b-40eb-bcb3-a3aeea8ba967",
+      "name": "Parse Sigma Rule",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://api.github.com/repos/{{ $json.owner }}/{{ $json.repo }}/git/ref/heads/{{ $json.base }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/vnd.github+json"
+            },
+            {
+              "name": "X-GitHub-Api-Version",
+              "value": "2022-11-28"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "66a581a4-0b1e-4f4f-aab8-0ee15807d17e",
+      "name": "Get Base Branch SHA",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1320,
+        300
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "github-token",
+          "name": "GitHub Token"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.github.com/repos/{{ $('Parse Sigma Rule').item.json.owner }}/{{ $('Parse Sigma Rule').item.json.repo }}/git/refs",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/vnd.github+json"
+            },
+            {
+              "name": "X-GitHub-Api-Version",
+              "value": "2022-11-28"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ ref: 'refs/heads/' + $('Parse Sigma Rule').item.json.branch, sha: $json.object.sha }) }}",
+        "options": {}
+      },
+      "id": "8d2f1fbd-ec89-4460-84ae-53e80fc5deb4",
+      "name": "Create Branch",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1540,
+        300
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "github-token",
+          "name": "GitHub Token"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "PUT",
+        "url": "=https://api.github.com/repos/{{ $('Parse Sigma Rule').item.json.owner }}/{{ $('Parse Sigma Rule').item.json.repo }}/contents/{{ $('Parse Sigma Rule').item.json.path }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/vnd.github+json"
+            },
+            {
+              "name": "X-GitHub-Api-Version",
+              "value": "2022-11-28"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ message: 'feat(detection): AI draft for ' + $('Parse Sigma Rule').item.json.cve, content: $('Parse Sigma Rule').item.json.content_b64, branch: $('Parse Sigma Rule').item.json.branch }) }}",
+        "options": {}
+      },
+      "id": "0e05978f-8cb1-478c-81a0-141c417689ce",
+      "name": "Commit Sigma Rule",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1760,
+        300
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "github-token",
+          "name": "GitHub Token"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.github.com/repos/{{ $('Parse Sigma Rule').item.json.owner }}/{{ $('Parse Sigma Rule').item.json.repo }}/pulls",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/vnd.github+json"
+            },
+            {
+              "name": "X-GitHub-Api-Version",
+              "value": "2022-11-28"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ title: 'Detection: ' + $('Parse Sigma Rule').item.json.cve + ' - ' + $('Parse Sigma Rule').item.json.vuln_name, head: $('Parse Sigma Rule').item.json.branch, base: $('Parse Sigma Rule').item.json.base, draft: true, body: '## AI-drafted detection for ' + $('Parse Sigma Rule').item.json.cve + '\\n\\n' + '**Vulnerability:** ' + $('Parse Sigma Rule').item.json.vuln_name + '\\n' + '**Vendor/Product:** ' + $('Parse Sigma Rule').item.json.vendor + ' / ' + $('Parse Sigma Rule').item.json.product + '\\n' + '**Known ransomware use:** ' + $('Parse Sigma Rule').item.json.ransomware + '\\n\\n' + 'Generated from the CISA KEV feed by n8n + Claude. CI validates syntax; a detection engineer must review logic.\\n\\n' + '### Reviewer checklist\\n- [ ] Logsource matches our telemetry\\n- [ ] Logic tested against benign baseline\\n' + '- [ ] Tested against exploit/emulation data (e.g. Atomic Red Team)\\n- [ ] ATT&CK tags correct\\n- [ ] Promote status from experimental' }) }}",
+        "options": {}
+      },
+      "id": "0114819a-c82c-4964-a19e-6678464b6d60",
+      "name": "Open Draft PR",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1980,
+        300
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "github-token",
+          "name": "GitHub Token"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "#detection-engineering",
+          "mode": "name"
+        },
+        "text": "=:shield: New AI-drafted detection for *{{ $('Parse Sigma Rule').item.json.cve }}* ({{ $('Parse Sigma Rule').item.json.vendor }} {{ $('Parse Sigma Rule').item.json.product }})\n{{ $('Parse Sigma Rule').item.json.vuln_name }}\nReview PR: {{ $json.html_url }}",
+        "otherOptions": {}
+      },
+      "id": "e21569d4-2adf-4883-b568-e56ab7d3db72",
+      "name": "Notify Detection Engineering",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [
+        2200,
+        300
+      ],
+      "credentials": {
+        "slackApi": {
+          "id": "slack",
+          "name": "Slack"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Daily Schedule": {
+      "main": [
+        [
+          {
+            "node": "Fetch CISA KEV Feed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch CISA KEV Feed": {
+      "main": [
+        [
+          {
+            "node": "Filter New & Relevant",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter New & Relevant": {
+      "main": [
+        [
+          {
+            "node": "Build Detection Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Detection Request": {
+      "main": [
+        [
+          {
+            "node": "Claude Draft Sigma Rule",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude Draft Sigma Rule": {
+      "main": [
+        [
+          {
+            "node": "Parse Sigma Rule",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Sigma Rule": {
+      "main": [
+        [
+          {
+            "node": "Get Base Branch SHA",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Base Branch SHA": {
+      "main": [
+        [
+          {
+            "node": "Create Branch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Branch": {
+      "main": [
+        [
+          {
+            "node": "Commit Sigma Rule",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Commit Sigma Rule": {
+      "main": [
+        [
+          {
+            "node": "Open Draft PR",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Open Draft PR": {
+      "main": [
+        [
+          {
+            "node": "Notify Detection Engineering",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "pinData": {},
+  "tags": []
+}

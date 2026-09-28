@@ -1,0 +1,500 @@
+{
+  "name": "TIDE | Alert Triage & Enrichment",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "edr-alert",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "82330ee6-9fdb-480b-9d44-ed3d6676ed56",
+      "name": "EDR Alert Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "webhook-auth",
+          "name": "Webhook Auth"
+        }
+      },
+      "webhookId": "cd8ae01b-dfe3-4c4c-b8de-a198549241f9"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normalize an incoming EDR/SIEM alert into a common schema.\n// Handles CrowdStrike Falcon-style detections and generic JSON alerts.\nconst body = $input.first().json.body ?? $input.first().json;\n\nconst pick = (...paths) => {\n  for (const p of paths) {\n    const v = p.split('.').reduce((o, k) => (o == null ? undefined : o[k]), body);\n    if (v !== undefined && v !== null && v !== '') return v;\n  }\n  return null;\n};\n\n// Redact obvious secrets BEFORE anything is sent to third-party APIs\nconst redact = (s) => s\n  .replace(/(password|passwd|pwd|secret|token|api[_-]?key)(\\\\?\"?\\s*[=:]\\s*\\\\?\"?)[^\\s\"\\\\,}]+/gi, '$1$2[REDACTED]')\n  .replace(/AKIA[0-9A-Z]{16}/g, '[REDACTED_AWS_KEY]');\n\nconst rawText = redact(JSON.stringify(body));\nconst uniq = (a) => [...new Set(a)];\n\nconst ips = uniq((rawText.match(/\\b(?:\\d{1,3}\\.){3}\\d{1,3}\\b/g) || [])\n  .filter(ip => !/^(10\\.|127\\.|192\\.168\\.|172\\.(1[6-9]|2\\d|3[01])\\.|0\\.|169\\.254\\.)/.test(ip)));\nconst sha256 = uniq(rawText.match(/\\b[a-fA-F0-9]{64}\\b/g) || []);\nconst domains = uniq((rawText.match(/\\b(?:[a-z0-9-]+\\.)+(?:com|net|org|io|ru|cn|xyz|top|info|biz|co|me|app|dev|site|online)\\b/gi) || [])\n  .map(d => d.toLowerCase()));\n\nreturn [{ json: {\n  alert_id: pick('detection_id', 'composite_id', 'id', 'alert_id') ?? `alert-${Date.now()}`,\n  source: pick('source', 'product') ?? 'edr',\n  received_at: new Date().toISOString(),\n  title: pick('name', 'title', 'display_name', 'description') ?? 'Untitled alert',\n  severity: pick('severity', 'max_severity_displayname', 'priority') ?? 'unknown',\n  hostname: pick('device.hostname', 'hostname', 'host'),\n  user: pick('user_name', 'user', 'username'),\n  tactic: pick('tactic', 'behaviors.0.tactic'),\n  technique: pick('technique_id', 'technique', 'behaviors.0.technique_id'),\n  command_line: pick('cmdline', 'command_line', 'behaviors.0.cmdline'),\n  parent_process: pick('parent_process', 'behaviors.0.parent_process'),\n  iocs: { ips, sha256, domains },\n  raw: JSON.parse(rawText),\n}}];"
+      },
+      "id": "55221386-2b0a-4a35-8ef6-18ccd75f6b3b",
+      "name": "Normalize Alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://www.virustotal.com/api/v3/files/{{ $json.iocs.sha256[0] || 'none' }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "id": "31cf50fd-c4cf-4326-8ebe-062013fa87d8",
+      "name": "VirusTotal Hash Lookup",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        440,
+        300
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "virustotal-api",
+          "name": "VirusTotal API"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://api.abuseipdb.com/api/v2/check",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "ipAddress",
+              "value": "={{ $('Normalize Alert').first().json.iocs.ips[0] || 'none' }}"
+            },
+            {
+              "name": "maxAgeInDays",
+              "value": "90"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "id": "28110312-8957-4ada-a17b-604b6c270754",
+      "name": "AbuseIPDB IP Lookup",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        660,
+        300
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "abuseipdb-api",
+          "name": "AbuseIPDB API"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Merge enrichment results and build the Claude triage request.\nconst alert = $('Normalize Alert').first().json;\nconst vt = $('VirusTotal Hash Lookup').first().json;\nconst abuse = $('AbuseIPDB IP Lookup').first().json;\n\nconst vtAttr = vt?.data?.attributes;\nconst enrichment = {\n  virustotal: vtAttr?.last_analysis_stats ? {\n    hash: alert.iocs.sha256[0],\n    malicious: vtAttr.last_analysis_stats.malicious,\n    suspicious: vtAttr.last_analysis_stats.suspicious,\n    harmless: vtAttr.last_analysis_stats.harmless,\n    names: (vtAttr.names || []).slice(0, 5),\n    threat_label: vtAttr.popular_threat_classification?.suggested_threat_label ?? null,\n  } : { status: alert.iocs.sha256.length ? 'not_found_or_error' : 'no_hash_in_alert' },\n  abuseipdb: abuse?.data ? {\n    ip: abuse.data.ipAddress,\n    abuse_confidence: abuse.data.abuseConfidenceScore,\n    country: abuse.data.countryCode,\n    isp: abuse.data.isp,\n    is_tor: abuse.data.isTor,\n    total_reports: abuse.data.totalReports,\n  } : { status: alert.iocs.ips.length ? 'not_found_or_error' : 'no_public_ip_in_alert' },\n};\n\nconst system = `You are a senior incident responder on an internal CSIRT. Triage the alert using ONLY the evidence provided.\nRespond with ONLY a JSON object (no markdown, no prose) with exactly these keys:\n{\n  \"verdict\": \"true_positive\" | \"benign_true_positive\" | \"false_positive\" | \"needs_review\",\n  \"confidence\": <integer 0-100>,\n  \"severity\": \"critical\" | \"high\" | \"medium\" | \"low\",\n  \"summary\": \"<2-3 sentence plain-language summary for a responder>\",\n  \"attack_mapping\": [{\"tactic\": \"\", \"technique_id\": \"\", \"technique_name\": \"\"}],\n  \"key_evidence\": [\"<specific observation from the data>\"],\n  \"recommended_actions\": [\"<investigative or containment step>\"],\n  \"tuning_suggestion\": \"<for false/benign positives: a concrete exclusion or logic change; otherwise null>\"\n}\nRules:\n- If enrichment is missing or evidence is ambiguous, use \"needs_review\".\n- Do not invent facts not present in the alert or enrichment.\n- Containment actions are recommendations only; an analyst approves them.`;\n\nreturn [{ json: {\n  alert,\n  enrichment,\n  claude_request: {\n    model: 'claude-sonnet-5',\n    max_tokens: 1500,\n    system,\n    messages: [{ role: 'user', content:\n      `Triage this alert.\\n\\nALERT:\\n${JSON.stringify(alert, null, 2)}\\n\\nENRICHMENT:\\n${JSON.stringify(enrichment, null, 2)}` }],\n  },\n}}];"
+      },
+      "id": "dff11b02-ec7c-47d2-bc92-8dfe1fdc4368",
+      "name": "Build Triage Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.claude_request) }}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "b68e73d1-eba2-4e0b-858f-8ea56a296ffb",
+      "name": "Claude Triage",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1100,
+        300
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "anthropic-api",
+          "name": "Anthropic API"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse Claude's verdict with a safe fallback and a confidence guardrail.\nconst ctx = $('Build Triage Context').first().json;\nconst resp = $input.first().json;\nlet t;\ntry {\n  const text = (resp.content || []).filter(b => b.type === 'text').map(b => b.text).join('');\n  t = JSON.parse(text.replace(/```json|```/g, '').trim());\n} catch (e) {\n  t = {\n    verdict: 'needs_review', confidence: 0,\n    severity: String(ctx.alert.severity || 'medium').toLowerCase(),\n    summary: 'Automated triage did not return a parseable verdict; manual review required.',\n    attack_mapping: [], key_evidence: [], recommended_actions: ['Manually triage this alert'],\n    tuning_suggestion: null, error: resp.error?.message || String(e.message || e),\n  };\n}\n\n// Guardrail: anything under 70% confidence goes to a human\nconst THRESHOLD = 70;\nif (t.verdict !== 'needs_review' && (t.confidence ?? 0) < THRESHOLD) {\n  t.original_verdict = t.verdict;\n  t.verdict = 'needs_review';\n}\n\nreturn [{ json: { ...ctx.alert, enrichment: ctx.enrichment, triage: t, verdict: t.verdict } }];"
+      },
+      "id": "962f85c6-37c1-4f73-bae0-1ebae0cd9a14",
+      "name": "Parse Verdict",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Pre-render the case payload and Slack messages for each route.\nconst a = $input.first().json;\nconst t = a.triage;\nconst techniques = (t.attack_mapping || []).filter(m => m.technique_id)\n  .map(m => `${m.technique_id} ${m.technique_name || ''}`.trim());\nconst bullets = (arr) => (arr || []).map(x => `\u2022 ${x}`).join('\\n') || '\u2022 none';\nconst header = `*${a.title}*\\nHost: \\`${a.hostname ?? 'n/a'}\\` | User: \\`${a.user ?? 'n/a'}\\` | Alert: \\`${a.alert_id}\\``;\n\nconst vt = a.enrichment.virustotal, ab = a.enrichment.abuseipdb;\nconst enrichLine = [\n  vt.malicious !== undefined ? `VT: ${vt.malicious} malicious${vt.threat_label ? ` (${vt.threat_label})` : ''}` : null,\n  ab.abuse_confidence !== undefined ? `AbuseIPDB: ${ab.ip} score ${ab.abuse_confidence}${ab.is_tor ? ' (Tor exit)' : ''}` : null,\n].filter(Boolean).join(' | ') || 'No external enrichment hits';\n\nconst jiraList = (arr) => (arr || []).map(x => `* ${x}`).join('\\n') || 'n/a';\n\nreturn [{ json: { ...a,\n  jira_payload: { fields: {\n    project: { key: 'CSIRT' },\n    issuetype: { name: 'Task' },\n    summary: `[${String(t.severity || 'medium').toUpperCase()}] ${a.title} on ${a.hostname ?? 'unknown host'}`.slice(0, 250),\n    labels: ['auto-triage', ...techniques.map(x => x.split(' ')[0].replace(/\\./g, '_'))],\n    description: [\n      `h3. Summary\\n${t.summary}`,\n      `h3. MITRE ATT&CK\\n${jiraList(techniques)}`,\n      `h3. Key evidence\\n${jiraList(t.key_evidence)}`,\n      `h3. Recommended actions (analyst approval required)\\n${jiraList(t.recommended_actions)}`,\n      `h3. Enrichment\\n${enrichLine}`,\n      `h3. Triage metadata\\nVerdict: ${t.verdict} | Confidence: ${t.confidence}% | Model: claude-sonnet-5`,\n      `h3. Raw alert (redacted)\\n{code:json}${JSON.stringify(a.raw, null, 2).slice(0, 20000)}{code}`,\n    ].join('\\n\\n'),\n  }},\n  slack_incident: `:rotating_light: *Likely true positive* (${t.confidence}% confidence, ${t.severity})\\n${header}\\n\\n${t.summary}\\n\\n*ATT&CK:* ${techniques.join(', ') || 'n/a'}\\n*Enrichment:* ${enrichLine}\\n*Recommended (needs approval):*\\n${bullets(t.recommended_actions)}`,\n  slack_tuning: `:broom: *${a.verdict.replace(/_/g, ' ')}*, not escalated (${t.confidence}% confidence)\\n${header}\\n\\n${t.summary}\\n*Tuning suggestion:* ${t.tuning_suggestion || 'none provided'}`,\n  slack_review: `:mag: *Needs analyst review*${t.original_verdict ? ` (model leaned ${t.original_verdict} at ${t.confidence}%)` : ''}\\n${header}\\n\\n${t.summary}\\n*Evidence:*\\n${bullets(t.key_evidence)}\\n*Enrichment:* ${enrichLine}`,\n}}];"
+      },
+      "id": "16a758e9-d819-4708-8850-1890ed48ff66",
+      "name": "Format Messages",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1540,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "expression",
+        "numberOutputs": 3,
+        "output": "={{ ({ true_positive: 0, false_positive: 1, benign_true_positive: 1 })[$json.verdict] ?? 2 }}"
+      },
+      "id": "712835d9-c6e1-456b-a321-ffcc0c930d89",
+      "name": "Route by Verdict",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [
+        1760,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://YOUR-DOMAIN.atlassian.net/rest/api/2/issue",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.jira_payload) }}",
+        "options": {}
+      },
+      "id": "260ccc9e-9e00-402c-b0c8-928a7034ab6c",
+      "name": "Create Jira Case",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2000,
+        100
+      ],
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "jira",
+          "name": "Jira"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "#csirt-alerts",
+          "mode": "name"
+        },
+        "text": "={{ $('Format Messages').first().json.slack_incident }}\n*Case:* {{ $json.key || 'case creation failed, check Jira node' }}",
+        "otherOptions": {}
+      },
+      "id": "9c793cef-c0d3-47b7-9368-c9ae0f936c7b",
+      "name": "Alert CSIRT Channel",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [
+        2220,
+        100
+      ],
+      "credentials": {
+        "slackApi": {
+          "id": "slack",
+          "name": "Slack"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "#detection-tuning",
+          "mode": "name"
+        },
+        "text": "={{ $json.slack_tuning }}",
+        "otherOptions": {}
+      },
+      "id": "aeed54b7-5d4b-45d4-ae19-9416d61e720b",
+      "name": "Post Tuning Note",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [
+        2000,
+        300
+      ],
+      "credentials": {
+        "slackApi": {
+          "id": "slack",
+          "name": "Slack"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "#csirt-triage",
+          "mode": "name"
+        },
+        "text": "={{ $json.slack_review }}",
+        "otherOptions": {}
+      },
+      "id": "4e7b752c-6540-4243-b73a-54cfd85b8588",
+      "name": "Queue for Analyst",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [
+        2000,
+        500
+      ],
+      "credentials": {
+        "slackApi": {
+          "id": "slack",
+          "name": "Slack"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ alert_id: $('Format Messages').first().json.alert_id, verdict: $('Format Messages').first().json.verdict, confidence: $('Format Messages').first().json.triage.confidence, severity: $('Format Messages').first().json.triage.severity }) }}",
+        "options": {}
+      },
+      "id": "6fc83685-381b-4386-b3d5-ee55ee92e4f3",
+      "name": "Respond with Verdict",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        2460,
+        300
+      ]
+    }
+  ],
+  "connections": {
+    "EDR Alert Webhook": {
+      "main": [
+        [
+          {
+            "node": "Normalize Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Alert": {
+      "main": [
+        [
+          {
+            "node": "VirusTotal Hash Lookup",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "VirusTotal Hash Lookup": {
+      "main": [
+        [
+          {
+            "node": "AbuseIPDB IP Lookup",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AbuseIPDB IP Lookup": {
+      "main": [
+        [
+          {
+            "node": "Build Triage Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Triage Context": {
+      "main": [
+        [
+          {
+            "node": "Claude Triage",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude Triage": {
+      "main": [
+        [
+          {
+            "node": "Parse Verdict",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Verdict": {
+      "main": [
+        [
+          {
+            "node": "Format Messages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Messages": {
+      "main": [
+        [
+          {
+            "node": "Route by Verdict",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route by Verdict": {
+      "main": [
+        [
+          {
+            "node": "Create Jira Case",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Post Tuning Note",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Queue for Analyst",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Jira Case": {
+      "main": [
+        [
+          {
+            "node": "Alert CSIRT Channel",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Alert CSIRT Channel": {
+      "main": [
+        [
+          {
+            "node": "Respond with Verdict",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Post Tuning Note": {
+      "main": [
+        [
+          {
+            "node": "Respond with Verdict",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Queue for Analyst": {
+      "main": [
+        [
+          {
+            "node": "Respond with Verdict",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "pinData": {},
+  "tags": []
+}

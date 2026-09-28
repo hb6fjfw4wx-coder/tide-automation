@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  detections:
+    name: Validate Sigma detections
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install tooling
+        run: pip install sigma-cli yamllint
+      - name: Lint YAML
+        run: yamllint -d relaxed rules/
+      - name: Validate Sigma rules
+        run: sigma check rules/
+      - name: Test conversion to Splunk SPL
+        run: |
+          sigma plugin install splunk
+          sigma convert -t splunk --without-pipeline rules/ -o converted.spl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: converted-queries
+          path: converted.spl
+
+  workflows:
+    name: Validate n8n workflows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: JSON is valid and has no pinned test data
+        run: |
+          for f in workflows/*.json; do
+            jq -e '.nodes and .connections' "$f" > /dev/null || { echo "Invalid: $f"; exit 1; }
+            jq -e '(.pinData // {}) == {}' "$f" > /dev/null || { echo "Pinned data found in $f"; exit 1; }
+          done
+
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
